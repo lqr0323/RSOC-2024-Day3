@@ -136,3 +136,161 @@ rt_err_t rt_mutex_trytake(rt_mutex_t mutex);
 ```
 rt_err_t rt_mutex_release(rt_mutex_t mutex);
 ```
+## 3.事件集工作机制
+事件集主要用于线程间的同步，与信号量不同，它的特点是可以实现一对多，多对多的同步。即一个线程与多个事件的关系可设置为：其中任意一个事件唤醒线程，或几个事件都到达后才唤醒线程进行后续的处理；同样，事件也可以是多个线程同步多个事件。这种多个事件的集合可以用一个 32 位无符号整型变量来表示，变量的每一位代表一个事件，线程通过 “逻辑与” 或“逻辑或”将一个或多个事件关联起来，形成事件组合。事件的 “逻辑或” 也称为是独立型同步，指的是线程与任何事件之一发生同步；事件 “逻辑与” 也称为是关联型同步，指的是线程与若干事件都发生同步。
+
+RT-Thread 定义的事件集有以下特点：
+
+1）事件只与线程相关，事件间相互独立：每个线程可拥有 32 个事件标志，采用一个 32 bit 无符号整型数进行记录，每一个 bit 代表一个事件；
+
+2）事件仅用于同步，不提供数据传输功能；
+
+3）事件无排队性，即多次向线程发送同一事件 (如果线程还未来得及读走)，其效果等同于只发送一次。
+
+在 RT-Thread 中，每个线程都拥有一个事件信息标记，它有三个属性，分别是 RT_EVENT_FLAG_AND(逻辑与)，RT_EVENT_FLAG_OR(逻辑或）以及 RT_EVENT_FLAG_CLEAR(清除标记）。当线程等待事件同步时，可以通过 32 个事件标志和这个事件信息标记来判断当前接收的事件是否满足同步条件。  
+### 事件集控制块
+在 RT-Thread 中，事件集控制块是操作系统用于管理事件的一个数据结构，由结构体 struct rt_event 表示。另外一种 C 表达方式 rt_event_t，表示的是事件集的句柄，在 C 语言中的实现是事件集控制块的指针。事件集控制块结构的详细定义请见以下代码：  
+```
+struct rt_event
+{
+    struct rt_ipc_object parent;    /* 继承自 ipc_object 类 */
+
+    /* 事件集合，每一 bit 表示 1 个事件，bit 位的值可以标记某事件是否发生 */
+    rt_uint32_t set;
+};
+/* rt_event_t 是指向事件结构体的指针类型  */
+typedef struct rt_event* rt_event_t;
+```
+## 4.测试代码   
+初始化引脚模式：
+初始化LED引脚为输出模式和按键引脚为输入模式。
+
+创建信号量和邮箱：
+创建一个信号量 key_sem 用于同步按键事件，创建一个邮箱 mb 用于传递按键事件（按下或松开）。
+
+全局变量：
+使用 key_press_count 记录按键按下的次数。
+
+按键线程：
+key_thread_entry 线程检测按键状态变化（按下或松开），在按下时增加 key_press_count，并发送相应的事件到邮箱，同时释放信号量。
+
+LED线程：
+led_thread_entry 线程等待信号量被释放，然后从邮箱中接收按键事件，根据事件控制LED的亮灭，并通过串口打印按键按下次数和LED状态。
+```
+#include <board.h>
+#include <rtthread.h>
+#include <drv_gpio.h>
+#ifndef RT_USING_NANO
+#include <rtdevice.h>
+#endif /* RT_USING_NANO */
+
+#define PIN_KEY0      GET_PIN(C, 0)     // PC0:  KEY0         --> KEY
+#define GPIO_LED_R    GET_PIN(F, 12)
+
+#define THREAD_PRIORITY         25
+#define THREAD_STACK_SIZE       1024
+#define THREAD_TIMESLICE        5
+
+static rt_thread_t tid1 = RT_NULL;
+static rt_thread_t tid2 = RT_NULL;
+static rt_sem_t key_sem = RT_NULL;
+static rt_mailbox_t mb = RT_NULL;
+static rt_uint32_t key_press_count = 0;  // 记录按键按下次数
+
+static void key_thread_entry(void *parameter);
+static void led_thread_entry(void *parameter);
+
+int main(void)
+{
+    // 初始化LED引脚为输出模式
+    rt_pin_mode(GPIO_LED_R, PIN_MODE_OUTPUT);
+    // 初始化按键引脚为输入模式
+    rt_pin_mode(PIN_KEY0, PIN_MODE_INPUT_PULLUP);
+
+    // 创建一个动态信号量
+    key_sem = rt_sem_create("key_sem", 0, RT_IPC_FLAG_PRIO);
+    if (key_sem == RT_NULL)
+    {
+        rt_kprintf("Create semaphore failed.\n");
+        return -1;
+    }
+
+    // 创建一个邮箱
+    mb = rt_mb_create("mb", 10, RT_IPC_FLAG_PRIO);
+    if (mb == RT_NULL)
+    {
+        rt_kprintf("Create mailbox failed.\n");
+        return -1;
+    }
+
+    // 创建按键线程
+    tid1 = rt_thread_create("key_thread",
+                            key_thread_entry, RT_NULL,
+                            THREAD_STACK_SIZE,
+                            THREAD_PRIORITY, THREAD_TIMESLICE);
+    if (tid1 != RT_NULL)
+        rt_thread_startup(tid1);
+
+    // 创建LED线程
+    tid2 = rt_thread_create("led_thread",
+                            led_thread_entry, RT_NULL,
+                            THREAD_STACK_SIZE,
+                            THREAD_PRIORITY, THREAD_TIMESLICE);
+    if (tid2 != RT_NULL)
+        rt_thread_startup(tid2);
+
+    return 0;
+}
+
+static void key_thread_entry(void *parameter)
+{
+    int key_state = 1; // 初始状态为松开
+    int prev_key_state = 1;
+    while (1)
+    {
+        key_state = rt_pin_read(PIN_KEY0);
+        if (key_state == PIN_LOW && prev_key_state == PIN_HIGH)
+        {
+            // 按键按下
+            rt_kprintf("KEY0 pressed!\r\n");
+            key_press_count++; // 增加按键按下次数
+            rt_mb_send(mb, 1); // 发送按下信号
+            rt_sem_release(key_sem);
+        }
+        else if (key_state == PIN_HIGH && prev_key_state == PIN_LOW)
+        {
+            // 按键松开
+            rt_kprintf("KEY0 released!\r\n");
+            rt_mb_send(mb, 0); // 发送松开信号
+            rt_sem_release(key_sem);
+        }
+        prev_key_state = key_state;
+        rt_thread_mdelay(10);
+    }
+}
+
+static void led_thread_entry(void *parameter)
+{
+    rt_uint32_t key_event = 0;
+    while (1)
+    {
+        rt_sem_take(key_sem, RT_WAITING_FOREVER); // 等待信号量
+        if (rt_mb_recv(mb, &key_event, RT_WAITING_FOREVER) == RT_EOK)
+        {
+            if (key_event == 1)
+            {
+                // 按键按下时点亮LED
+                rt_kprintf("LED ON\r\n");
+                rt_kprintf("Key press count: %d\r\n", key_press_count);
+                rt_pin_write(GPIO_LED_R, PIN_HIGH);
+            }
+            else
+            {
+                // 按键松开时熄灭LED
+                rt_kprintf("LED OFF\r\n");
+            }
+        }
+    }
+}
+```
+## 5.测试截图  
