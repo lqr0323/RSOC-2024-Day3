@@ -293,4 +293,6 @@ static void led_thread_entry(void *parameter)
     }
 }
 ```
-## 5.测试截图  
+## 5.测试截图    
+![today's code ](https://github.com/lqr0323/RSOC-2024-Day3/blob/main/%E5%B1%8F%E5%B9%95%E6%88%AA%E5%9B%BE%202024-07-24%20174116.png)  
+## 打卡下班，去搞电赛去咯
